@@ -13,7 +13,6 @@ MIN_IQR_SAMPLE = 8
 MIN_JUMP_THRESHOLD_PCT = 10.0
 MIN_DEVIATION_THRESHOLD_PCT = 15.0
 MIN_HISTORY_DATES = 5
-EXCLUDE_PRICE_ANOMALIES = True
 PRICE_INDEX_HIGH = 1.05
 PRICE_INDEX_LOW = 0.95
 DISCOUNT_DIFF_PP = 5.0
@@ -59,7 +58,7 @@ def resolve_columns(columns):
         elif canonical in REQUIRED:
             missing.append(f"{DISPLAY.get(canonical, canonical)}: {', '.join(aliases)}")
     if missing:
-        raise ValueError("Не найдены обязательные столбцы:\n- " + "\n- ".join(missing))
+        raise ValueError("Не найдены столбцы: " + ", ".join(missing))
     return result
 
 def parse_numeric(series):
@@ -111,26 +110,20 @@ def reliability_label(n):
     return "Нет данных"
 
 def run_analysis(input_file):
-    # 1. Читаем файл (сначала calamine, если не вышло - openpyxl)
+    # Читаем файл (используем стандартный openpyxl)
     try:
-        raw = pd.read_excel(input_file, sheet_name=1, engine="calamine")
+        raw = pd.read_excel(input_file, sheet_name=1, engine="openpyxl")
     except Exception:
-        try:
-            raw = pd.read_excel(input_file, sheet_name=0, engine="calamine")
-        except Exception:
-            try:
-                raw = pd.read_excel(input_file, sheet_name=1, engine="openpyxl")
-            except Exception:
-                raw = pd.read_excel(input_file, sheet_name=0, engine="openpyxl")
+        raw = pd.read_excel(input_file, sheet_name=0, engine="openpyxl")
 
     if not isinstance(raw, pd.DataFrame) or raw.empty:
-        raise ValueError("Файл пуст или не является таблицей.")
+        raise ValueError("Файл пуст.")
 
     source_count = len(raw)
     colmap = resolve_columns(raw.columns)
     df = raw.rename(columns={actual: key for key, actual in colmap.items()}).copy()
 
-    # 2. Подготовка данных
+    # Обработка
     for col in OPTIONAL_TEXT:
         df[col] = clean_string(df[col]).fillna("Не указано") if col in df.columns else "Не указано"
     for col in ["sku", "competitor"]:
@@ -141,7 +134,6 @@ def run_analysis(input_file):
     for col in ["competitor_promo", "lenta_promo"]:
         df[col] = parse_numeric(df[col]) if col in df.columns else np.nan
 
-    # 3. Фильтрация
     missing_key = df[["sku", "competitor", "date"]].isna().any(axis=1)
     bad_price = (df["competitor_regular"].isna() | df["lenta_regular"].isna() | df["competitor_regular"].le(0) | df["lenta_regular"].le(0))
     bad_turnover = df["turnover"].isna() | df["turnover"].lt(0)
@@ -163,12 +155,13 @@ def run_analysis(input_file):
     duplicates["Причина исключения"] = "Полный дубликат"
     valid = valid.loc[~dup_mask].copy()
 
-    # 4. Поиск аномалий
+    # Считаем индексы и сегменты
     series_key = ["city", "sku", "competitor"]
     valid = valid.sort_values(series_key + ["date"], kind="mergesort").reset_index(drop=True)
     
     valid["Изм_конк_%"] = valid.groupby(series_key)["competitor_regular"].transform(pct_change)
     valid["Изм_лент_%"] = valid.groupby(series_key)["lenta_regular"].transform(pct_change)
+    
     jump_limits = valid.groupby("group")["Изм_конк_%"].apply(lambda x: iqr_threshold(x.abs(), MIN_JUMP_THRESHOLD_PCT)).to_dict()
     valid["Порог_ск"] = valid["group"].map(jump_limits).fillna(MIN_JUMP_THRESHOLD_PCT)
 
@@ -190,20 +183,18 @@ def run_analysis(input_file):
     anomalies["Причина исключения"] = "Аномалия: " + anomalies["Ценовая аномалия"]
     analysis_rows = valid.loc[valid["Ценовая аномалия"].eq("")].copy()
 
-    # 5. Снимок последней даты
     last_dates = analysis_rows.groupby(["city", "sku"])["date"].max().rename("last_date").reset_index()
     latest_rows = analysis_rows.merge(last_dates, on=["city", "sku"], how="inner")
     latest_rows = latest_rows.loc[latest_rows["date"].eq(latest_rows["last_date"])].copy()
 
     latest_agg = latest_rows.groupby(["city", "sku"], as_index=False).agg(
-        **{"category": ("category", "first"), "subcategory": ("subcategory", "first"), "group": ("group", "first"),
+        **{"category": ("category", "first"), "subcategory": ("subcategory", "first"),
            "Цена Ленты (рег.)": ("lenta_regular", "median"), "Цена рынка (медиана)": ("competitor_regular", "median"),
            "Промо Ленты": ("lenta_promo", "median"), "Промо рынка (медиана)": ("competitor_promo", "median"),
            "Товарооборот": ("turnover", "median"), "Количество конкурентов": ("competitor", "nunique"), 
            "Последняя дата": ("date", "max")})
 
     latest_agg["Индекс регулярной цены"] = safe_ratio(latest_agg["Цена Ленты (рег.)"], latest_agg["Цена рынка (медиана)"])
-    latest_agg["Индекс регулярной цены (история)"] = latest_agg["Индекс регулярной цены"]
     latest_agg["Достоверность"] = latest_agg["Количество конкурентов"].map(reliability_label)
     latest_agg["Скидка Ленты, %"] = ((1 - latest_agg["Промо Ленты"] / latest_agg["Цена Ленты (рег.)"]) * 100).where(latest_agg["Промо Ленты"].gt(0) & latest_agg["Промо Ленты"].le(latest_agg["Цена Ленты (рег.)"]))
     latest_agg["Скидка конкурента, %"] = ((1 - latest_agg["Промо рынка (медиана)"] / latest_agg["Цена рынка (медиана)"]) * 100).where(latest_agg["Промо рынка (медиана)"].gt(0) & latest_agg["Промо рынка (медиана)"].le(latest_agg["Цена рынка (медиана)"]))
@@ -229,12 +220,12 @@ def run_analysis(input_file):
     sku.loc[diff < -DISCOUNT_DIFF_PP, "Сравнение скидок"] = "Скидка Ленты меньше"
     sku.loc[diff.notna() & (diff >= -DISCOUNT_DIFF_PP) & (diff <= DISCOUNT_DIFF_PP), "Сравнение скидок"] = "Скидки сопоставимы"
 
-    # 6. Экспорт
+    # Экспорт
     excluded_parts = [x for x in [invalid, duplicates, anomalies] if not x.empty]
     excluded = pd.concat(excluded_parts, ignore_index=True, sort=False) if excluded_parts else pd.DataFrame()
     
     if not excluded.empty:
-        base_cols = ["city", "sku", "category", "subcategory", "date", "competitor", "competitor_regular", "lenta_regular", "turnover", "Причина исключения"]
+        base_cols = ["city", "sku", "date", "competitor", "Причина исключения"]
         excluded_export = excluded[[c for c in base_cols if c in excluded.columns]].rename(columns=DISPLAY)
     else:
         excluded_export = pd.DataFrame(columns=["Город", "СКЮ", "Причина исключения"])
@@ -243,9 +234,12 @@ def run_analysis(input_file):
     final_cols = ["Сегмент", "Достоверность", "Сравнение скидок", "Город", "СКЮ", "Категория", "Подкатегория", "Товарооборот", "Индекс регулярной цены", "Скидка Ленты, %", "Скидка конкурента, %", "Разница скидок, п.п.", "Количество конкурентов", "Последняя дата"]
     clean_export = clean_export[[c for c in final_cols if c in clean_export.columns]]
 
+    # ВАЖНО: Заменяем все NaN и inf на пустые строки перед сохранением, чтобы xlsxwriter не упал!
+    clean_export = clean_export.replace([np.inf, -np.inf], np.nan).fillna("")
+    excluded_export = excluded_export.replace([np.inf, -np.inf], np.nan).fillna("")
+
     stats = pd.DataFrame([("Всего строк:", int(source_count)), ("Прошли:", int(len(analysis_rows))), (f"Исключено: {len(invalid)+len(duplicates)+len(anomalies)}", "")], columns=["Показатель", "Значение"])
 
-    # 7. Запись в Excel (МАКСИМАЛЬНО БЫСТРАЯ, БЕЗ ФОРМАТИРОВАНИЯ)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         stats.to_excel(writer, sheet_name="1. Сводка", index=False)
@@ -275,9 +269,11 @@ if uploaded_file is not None:
                 st.download_button(
                     label="📥 Скачать отчет",
                     data=excel_data,
-                    file_name="Итоговый_отчет.xlsx",
+                    file_name="Итоговый_отчет_Лента.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
             except Exception as e:
-                st.error(f"❌ Ошибка: {e}")
+                # Если что-то пойдет не так, мы увидим ошибку ПРЯМО НА САЙТЕ, а не в txt файле
+                st.error("Произошла ошибка при создании файла:")
+                st.exception(e)
