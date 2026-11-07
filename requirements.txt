@@ -3,4 +3,3 @@ pandas
 numpy
 openpyxl
 xlsxwriter
-python-calamine
