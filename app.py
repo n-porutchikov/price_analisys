@@ -8,7 +8,7 @@ import os
 import io
 
 # ==============================================================================
-# 1. КОНСТАНТЫ И ЛОГИКА АНАЛИЗА (Взято из твоего exe-файла без изменений)
+# 1. КОНСТАНТЫ И ЛОГИКА АНАЛИЗА
 # ==============================================================================
 IQR_MULTIPLIER = 3.0
 MIN_IQR_SAMPLE = 8
@@ -120,7 +120,7 @@ def reliability_label(n):
     return "Нет данных"
 
 # ==============================================================================
-# 2. ОСНОВНАЯ ФУНКЦИЯ АНАЛИЗА (Возвращает готовый Excel в виде байтов)
+# 2. ОСНОВНАЯ ФУНКЦИЯ АНАЛИЗА
 # ==============================================================================
 def run_analysis(input_file, sheet_index):
     try:
@@ -186,10 +186,14 @@ def run_analysis(input_file, sheet_index):
     valid["Порог отклонения, %"] = valid["group"].map(deviation_limits).fillna(MIN_DEVIATION_THRESHOLD_PCT)
     valid["Дат в истории"] = valid.groupby(series_key)["date"].transform("nunique")
 
-    jump_flag = (valid["Изменение цены конкурента, %"].abs().gt(valid["Порог скачка, %"]) & valid["Изменение цены Ленты, %"].abs().le(valid["Порог скачка, %"]))
-    deviation_flag = (valid["Отклонение от медианы ряда, %"].abs().gt(valid["Порог отклонения, %"]) & valid["Дат в истории"].ge(MIN_HISTORY_DATES))
+    # ИСПРАВЛЕНИЕ: Заменяем np.select на безопасные условия
+    jump_flag = (valid["Изменение цены конкурента, %"].abs().gt(valid["Порог скачка, %"]) & valid["Изменение цены Ленты, %"].abs().le(valid["Порог скачка, %"])).fillna(False)
+    deviation_flag = (valid["Отклонение от медианы ряда, %"].abs().gt(valid["Порог отклонения, %"]) & valid["Дат в истории"].ge(MIN_HISTORY_DATES)).fillna(False)
 
-    valid["Ценовая аномалия"] = np.select([jump_flag & deviation_flag, jump_flag, deviation_flag], ["Скачок цены и отклонение", "Резкий скачок", "Отклонение от медианы"], default="")
+    valid["Ценовая аномалия"] = ""
+    valid.loc[jump_flag & deviation_flag, "Ценовая аномалия"] = "Скачок цены и отклонение"
+    valid.loc[jump_flag & ~deviation_flag, "Ценовая аномалия"] = "Резкий скачок"
+    valid.loc[~jump_flag & deviation_flag, "Ценовая аномалия"] = "Отклонение от медианы"
     
     anomalies = valid.loc[valid["Ценовая аномалия"].ne("")].copy()
     analysis_rows = valid.loc[valid["Ценовая аномалия"].eq("")].copy() if EXCLUDE_PRICE_ANOMALIES else valid.copy()
@@ -213,16 +217,27 @@ def run_analysis(input_file, sheet_index):
 
     sku = latest_agg.copy()
     sku["Медианный ТО подкатегории"] = sku.groupby(["city", "subcategory"])["Товарооборот"].transform("median")
-    high_price = sku["Индекс регулярной цены"].gt(PRICE_INDEX_HIGH)
-    low_price = sku["Индекс регулярной цены"].lt(PRICE_INDEX_LOW)
-    high_turnover = sku["Товарооборот"].gt(sku["Медианный ТО подкатегории"])
+    
+    # ИСПРАВЛЕНИЕ: Заменяем np.select на безопасные условия
+    high_price = sku["Индекс регулярной цены"].gt(PRICE_INDEX_HIGH).fillna(False)
+    low_price = sku["Индекс регулярной цены"].lt(PRICE_INDEX_LOW).fillna(False)
+    high_turnover = sku["Товарооборот"].gt(sku["Медианный ТО подкатегории"]).fillna(False)
 
-    sku["Сегмент"] = np.select([high_price & high_turnover, high_price & ~high_turnover, low_price & high_turnover, low_price & ~high_turnover], ["Дороже рынка / высокий ТО", "Дороже рынка / низкий ТО", "Дешевле рынка / высокий ТО", "Дешевле рынка / низкий ТО"], default="Ценовой паритет")
+    sku["Сегмент"] = "Ценовой паритет"
+    sku.loc[high_price & high_turnover, "Сегмент"] = "Дороже рынка / высокий ТО"
+    sku.loc[high_price & ~high_turnover, "Сегмент"] = "Дороже рынка / низкий ТО"
+    sku.loc[low_price & high_turnover, "Сегмент"] = "Дешевле рынка / высокий ТО"
+    sku.loc[low_price & ~high_turnover, "Сегмент"] = "Дешевле рынка / низкий ТО"
+    
     no_data = (sku["Индекс регулярной цены"].isna() | sku["Товарооборот"].isna() | sku["Медианный ТО подкатегории"].isna())
     sku.loc[no_data, "Сегмент"] = "Недостаточно данных"
 
+    # ИСПРАВЛЕНИЕ: Заменяем np.select на безопасные условия
     diff = sku["Разница скидок, п.п."]
-    sku["Сравнение скидок"] = np.select([diff.gt(DISCOUNT_DIFF_PP), diff.lt(-DISCOUNT_DIFF_PP), diff.notna()], ["Скидка Ленты глубже", "Скидка Ленты меньше", "Скидки сопоставимы"], default="Нет данных")
+    sku["Сравнение скидок"] = "Нет данных"
+    sku.loc[diff > DISCOUNT_DIFF_PP, "Сравнение скидок"] = "Скидка Ленты глубже"
+    sku.loc[diff < -DISCOUNT_DIFF_PP, "Сравнение скидок"] = "Скидка Ленты меньше"
+    sku.loc[diff.notna() & (diff >= -DISCOUNT_DIFF_PP) & (diff <= DISCOUNT_DIFF_PP), "Сравнение скидок"] = "Скидки сопоставимы"
 
     category = sku.groupby(["city", "category"], as_index=False, dropna=False).agg(**{"Товарооборот": ("Товарооборот", "sum"), "Количество SKU": ("sku", "nunique"), "Медианный индекс цены": ("Индекс регулярной цены", "median"), "Дороже рынка / низкий ТО": ("Сегмент", lambda x: int((x == "Дороже рынка / низкий ТО").sum())), "Дешевле рынка / высокий ТО": ("Сегмент", lambda x: int((x == "Дешевле рынка / высокий ТО").sum()))})
     city_total = category.groupby("city")["Товарооборот"].transform("sum")
@@ -238,12 +253,10 @@ def run_analysis(input_file, sheet_index):
     excluded_parts = [x for x in [invalid, duplicates, conflict_rows, anomalies] if not x.empty]
     excluded = pd.concat(excluded_parts, ignore_index=True, sort=False) if excluded_parts else pd.DataFrame()
 
-    # Экспортные формы
     clean_export = sku.rename(columns={"city": "Город", "sku": "СКЮ", "category": "Категория", "subcategory": "Подкатегория", "group": "Группа"})
     final_cols = ["Сегмент", "Сравнение скидок", "Город", "СКЮ", "Категория", "Подкатегория", "Товарооборот", "Индекс регулярной цены", "Скидка Ленты, %", "Скидка конкурента, %", "Разница скидок, п.п.", "Количество конкурентов", "Последняя дата наблюдения"]
     clean_export = clean_export[[c for c in final_cols if c in clean_export.columns]]
 
-    # Запись в Excel (в буфер обмена)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter", engine_kwargs={"options": {"nan_inf_to_errors": True}}) as writer:
         wb = writer.book
@@ -264,7 +277,6 @@ def run_analysis(input_file, sheet_index):
 # 3. ИНТЕРФЕЙС STREAMLIT (Веб-страница)
 # ==============================================================================
 st.set_page_config(page_title="Анализ цен Ленты", page_icon="🛒", layout="centered")
-
 st.title("🛒 Анализ цен и товарооборота «Ленты»")
 st.markdown("Загрузите исходный Excel-файл, и программа сформирует готовый аналитический отчет.")
 
@@ -276,13 +288,10 @@ if uploaded_file is not None:
     if st.button("🚀 Запустить анализ", use_container_width=True):
         with st.spinner("⏳ Идет обработка данных, это может занять несколько минут..."):
             try:
-                # Вызов нашей функции
                 excel_data = run_analysis(uploaded_file, sheet_index=1)
-                
                 st.success("🎉 Анализ успешно завершен!")
                 st.balloons()
                 
-                # Кнопка скачивания
                 st.download_button(
                     label="📥 Скачать готовый отчет",
                     data=excel_data,
