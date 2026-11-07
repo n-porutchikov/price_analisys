@@ -111,21 +111,26 @@ def reliability_label(n):
     return "Нет данных"
 
 def run_analysis(input_file):
+    # 1. Читаем файл (сначала calamine, если не вышло - openpyxl)
     try:
         raw = pd.read_excel(input_file, sheet_name=1, engine="calamine")
     except Exception:
         try:
             raw = pd.read_excel(input_file, sheet_name=0, engine="calamine")
         except Exception:
-            raw = pd.read_excel(input_file, sheet_name=1, engine="openpyxl")
+            try:
+                raw = pd.read_excel(input_file, sheet_name=1, engine="openpyxl")
+            except Exception:
+                raw = pd.read_excel(input_file, sheet_name=0, engine="openpyxl")
 
     if not isinstance(raw, pd.DataFrame) or raw.empty:
-        raise ValueError("Выбранный лист пуст или не является таблицей.")
+        raise ValueError("Файл пуст или не является таблицей.")
 
     source_count = len(raw)
     colmap = resolve_columns(raw.columns)
     df = raw.rename(columns={actual: key for key, actual in colmap.items()}).copy()
 
+    # 2. Подготовка данных
     for col in OPTIONAL_TEXT:
         df[col] = clean_string(df[col]).fillna("Не указано") if col in df.columns else "Не указано"
     for col in ["sku", "competitor"]:
@@ -136,6 +141,7 @@ def run_analysis(input_file):
     for col in ["competitor_promo", "lenta_promo"]:
         df[col] = parse_numeric(df[col]) if col in df.columns else np.nan
 
+    # 3. Фильтрация
     missing_key = df[["sku", "competitor", "date"]].isna().any(axis=1)
     bad_price = (df["competitor_regular"].isna() | df["lenta_regular"].isna() | df["competitor_regular"].le(0) | df["lenta_regular"].le(0))
     bad_turnover = df["turnover"].isna() | df["turnover"].lt(0)
@@ -157,63 +163,50 @@ def run_analysis(input_file):
     duplicates["Причина исключения"] = "Полный дубликат"
     valid = valid.loc[~dup_mask].copy()
 
-    conflict_key = ["city", "sku", "competitor", "date"]
-    value_cols = ["competitor_regular", "lenta_regular", "turnover", "competitor_promo", "lenta_promo"]
-    variants = (valid.groupby(conflict_key, dropna=False)[value_cols].apply(lambda x: len(x.drop_duplicates())).rename("Вариантов").reset_index())
-    conflict_keys = variants.loc[variants["Вариантов"] > 1, conflict_key]
-    if not conflict_keys.empty:
-        conflict_rows = valid.merge(conflict_keys, on=conflict_key, how="inner")
-        conflict_rows["Причина исключения"] = "Конфликт дат"
-        valid = valid.merge(conflict_keys.assign(_c=True), on=conflict_key, how="left")
-        valid = valid.loc[valid["_c"].isna()].drop(columns="_c")
-    else:
-        conflict_rows = valid.iloc[0:0].copy()
-        conflict_rows["Причина исключения"] = pd.Series(dtype="object")
-
-    valid = valid.sort_values(["city", "sku", "competitor", "date"], kind="mergesort").reset_index(drop=True)
-
+    # 4. Поиск аномалий
     series_key = ["city", "sku", "competitor"]
-    valid["Изменение цены конкурента, %"] = valid.groupby(series_key)["competitor_regular"].transform(pct_change)
-    valid["Изменение цены Ленты, %"] = valid.groupby(series_key)["lenta_regular"].transform(pct_change)
+    valid = valid.sort_values(series_key + ["date"], kind="mergesort").reset_index(drop=True)
+    
+    valid["Изм_конк_%"] = valid.groupby(series_key)["competitor_regular"].transform(pct_change)
+    valid["Изм_лент_%"] = valid.groupby(series_key)["lenta_regular"].transform(pct_change)
+    jump_limits = valid.groupby("group")["Изм_конк_%"].apply(lambda x: iqr_threshold(x.abs(), MIN_JUMP_THRESHOLD_PCT)).to_dict()
+    valid["Порог_ск"] = valid["group"].map(jump_limits).fillna(MIN_JUMP_THRESHOLD_PCT)
 
-    jump_limits = (valid.groupby("group")["Изменение цены конкурента, %"].apply(lambda x: iqr_threshold(x.abs(), MIN_JUMP_THRESHOLD_PCT)).to_dict())
-    valid["Порог скачка, %"] = valid["group"].map(jump_limits).fillna(MIN_JUMP_THRESHOLD_PCT)
+    valid["Мед_конк"] = valid.groupby(series_key)["competitor_regular"].transform("median")
+    valid["Откл_%"] = (valid["competitor_regular"] / valid["Мед_конк"] - 1) * 100
+    dev_limits = valid.groupby("group")["Откл_%"].apply(lambda x: iqr_threshold(x.abs(), MIN_DEVIATION_THRESHOLD_PCT)).to_dict()
+    valid["Порог_откл"] = valid["group"].map(dev_limits).fillna(MIN_DEVIATION_THRESHOLD_PCT)
+    valid["Дат"] = valid.groupby(series_key)["date"].transform("nunique")
 
-    valid["Медианная цена конкурента в ряду"] = valid.groupby(series_key)["competitor_regular"].transform("median")
-    valid["Отклонение от медианы ряда, %"] = ((valid["competitor_regular"] / valid["Медианная цена конкурента в ряду"] - 1) * 100)
-
-    deviation_limits = (valid.groupby("group")["Отклонение от медианы ряда, %"].apply(lambda x: iqr_threshold(x.abs(), MIN_DEVIATION_THRESHOLD_PCT)).to_dict())
-    valid["Порог отклонения, %"] = valid["group"].map(deviation_limits).fillna(MIN_DEVIATION_THRESHOLD_PCT)
-    valid["Дат в истории"] = valid.groupby(series_key)["date"].transform("nunique")
-
-    jump_flag = (valid["Изменение цены конкурента, %"].abs().gt(valid["Порог скачка, %"]) & valid["Изменение цены Ленты, %"].abs().le(valid["Порог скачка, %"])).fillna(False)
-    deviation_flag = (valid["Отклонение от медианы ряда, %"].abs().gt(valid["Порог отклонения, %"]) & valid["Дат в истории"].ge(MIN_HISTORY_DATES)).fillna(False)
+    jump_flag = (valid["Изм_конк_%"].abs().gt(valid["Порог_ск"]) & valid["Изм_лент_%"].abs().le(valid["Порог_ск"])).fillna(False)
+    dev_flag = (valid["Откл_%"].abs().gt(valid["Порог_откл"]) & valid["Дат"].ge(MIN_HISTORY_DATES)).fillna(False)
 
     valid["Ценовая аномалия"] = ""
-    valid.loc[jump_flag & deviation_flag, "Ценовая аномалия"] = "Скачок цены и отклонение от медианы"
-    valid.loc[jump_flag & ~deviation_flag, "Ценовая аномалия"] = "Резкий скачок цены конкурента при стабильной цене Ленты"
-    valid.loc[~jump_flag & deviation_flag, "Ценовая аномалия"] = "Отклонение от исторической медианы"
+    valid.loc[jump_flag & dev_flag, "Ценовая аномалия"] = "Скачок и отклонение"
+    valid.loc[jump_flag & ~dev_flag, "Ценовая аномалия"] = "Резкий скачок"
+    valid.loc[~jump_flag & dev_flag, "Ценовая аномалия"] = "Отклонение от медианы"
 
     anomalies = valid.loc[valid["Ценовая аномалия"].ne("")].copy()
-    anomalies["Причина исключения"] = "Ценовая аномалия: " + anomalies["Ценовая аномалия"]
-    analysis_rows = valid.loc[valid["Ценовая аномалия"].eq("")].copy() if EXCLUDE_PRICE_ANOMALIES else valid.copy()
+    anomalies["Причина исключения"] = "Аномалия: " + anomalies["Ценовая аномалия"]
+    analysis_rows = valid.loc[valid["Ценовая аномалия"].eq("")].copy()
 
-    last_dates = (analysis_rows.groupby(["city", "sku"])["date"].max().rename("last_date").reset_index())
+    # 5. Снимок последней даты
+    last_dates = analysis_rows.groupby(["city", "sku"])["date"].max().rename("last_date").reset_index()
     latest_rows = analysis_rows.merge(last_dates, on=["city", "sku"], how="inner")
     latest_rows = latest_rows.loc[latest_rows["date"].eq(latest_rows["last_date"])].copy()
 
     latest_agg = latest_rows.groupby(["city", "sku"], as_index=False).agg(
         **{"category": ("category", "first"), "subcategory": ("subcategory", "first"), "group": ("group", "first"),
-           "Цена Ленты (рег.)": ("lenta_regular", "median"), "Цена рынка (медиана по конкурентам)": ("competitor_regular", "median"),
+           "Цена Ленты (рег.)": ("lenta_regular", "median"), "Цена рынка (медиана)": ("competitor_regular", "median"),
            "Промо Ленты": ("lenta_promo", "median"), "Промо рынка (медиана)": ("competitor_promo", "median"),
-           "Товарооборот": ("turnover", "median"), "Разных значений ТО": ("turnover", "nunique"),
-           "Количество конкурентов": ("competitor", "nunique"), "Последняя дата наблюдения": ("date", "max")})
+           "Товарооборот": ("turnover", "median"), "Количество конкурентов": ("competitor", "nunique"), 
+           "Последняя дата": ("date", "max")})
 
-    latest_agg["Индекс регулярной цены"] = safe_ratio(latest_agg["Цена Ленты (рег.)"], latest_agg["Цена рынка (медиана по конкурентам)"])
+    latest_agg["Индекс регулярной цены"] = safe_ratio(latest_agg["Цена Ленты (рег.)"], latest_agg["Цена рынка (медиана)"])
     latest_agg["Индекс регулярной цены (история)"] = latest_agg["Индекс регулярной цены"]
-    latest_agg["Достоверность индекса"] = latest_agg["Количество конкурентов"].map(reliability_label)
+    latest_agg["Достоверность"] = latest_agg["Количество конкурентов"].map(reliability_label)
     latest_agg["Скидка Ленты, %"] = ((1 - latest_agg["Промо Ленты"] / latest_agg["Цена Ленты (рег.)"]) * 100).where(latest_agg["Промо Ленты"].gt(0) & latest_agg["Промо Ленты"].le(latest_agg["Цена Ленты (рег.)"]))
-    latest_agg["Скидка конкурента, %"] = ((1 - latest_agg["Промо рынка (медиана)"] / latest_agg["Цена рынка (медиана по конкурентам)"]) * 100).where(latest_agg["Промо рынка (медиана)"].gt(0) & latest_agg["Промо рынка (медиана)"].le(latest_agg["Цена рынка (медиана по конкурентам)"]))
+    latest_agg["Скидка конкурента, %"] = ((1 - latest_agg["Промо рынка (медиана)"] / latest_agg["Цена рынка (медиана)"]) * 100).where(latest_agg["Промо рынка (медиана)"].gt(0) & latest_agg["Промо рынка (медиана)"].le(latest_agg["Цена рынка (медиана)"]))
     latest_agg["Разница скидок, п.п."] = latest_agg["Скидка Ленты, %"] - latest_agg["Скидка конкурента, %"]
 
     sku = latest_agg.copy()
@@ -231,87 +224,58 @@ def run_analysis(input_file):
     sku.loc[sku["Индекс регулярной цены"].isna() | sku["Товарооборот"].isna(), "Сегмент"] = "Недостаточно данных"
 
     diff = sku["Разница скидок, п.п."]
-    sku["Сравнение скидок"] = "Нет сопоставимых данных"
+    sku["Сравнение скидок"] = "Нет данных"
     sku.loc[diff > DISCOUNT_DIFF_PP, "Сравнение скидок"] = "Скидка Ленты глубже"
     sku.loc[diff < -DISCOUNT_DIFF_PP, "Сравнение скидок"] = "Скидка Ленты меньше"
     sku.loc[diff.notna() & (diff >= -DISCOUNT_DIFF_PP) & (diff <= DISCOUNT_DIFF_PP), "Сравнение скидок"] = "Скидки сопоставимы"
 
-    category = sku.groupby(["city", "category"], as_index=False, dropna=False).agg(**{"Товарооборот": ("Товарооборот", "sum"), "Количество SKU": ("sku", "nunique"), "Медианный индекс цены": ("Индекс регулярной цены", "median"), "Дороже рынка / низкий ТО": ("Сегмент", lambda x: int((x == "Дороже рынка / низкий ТО").sum())), "Дешевле рынка / высокий ТО": ("Сегмент", lambda x: int((x == "Дешевле рынка / высокий ТО").sum())), "Дороже рынка / высокий ТО": ("Сегмент", lambda x: int((x == "Дороже рынка / высокий ТО").sum())), "Дешевле рынка / низкий ТО": ("Сегмент", lambda x: int((x == "Дешевле рынка / низкий ТО").sum()))})
-    city_total = category.groupby("city")["Товарооборот"].transform("sum")
-    category["Доля ТО в городе, %"] = safe_ratio(category["Товарооборот"], city_total) * 100
-
-    rankable = category.loc[category["Количество SKU"] >= MIN_SKU_FOR_CATEGORY_RANKING].copy()
-    risk_categories = (rankable.sort_values(["Дороже рынка / низкий ТО", "Товарооборот"], ascending=[False, False]).head(10))
-    opportunity_categories = (rankable.sort_values(["Дешевле рынка / высокий ТО", "Товарооборот"], ascending=[False, False]).head(10))
-
-    sku_cols = ["city", "sku", "category", "subcategory", "Товарооборот", "Индекс регулярной цены", "Сегмент", "Сравнение скидок", "Количество конкурентов"]
-    risk_sku = (sku.loc[sku["Сегмент"] == "Дороже рынка / низкий ТО"].sort_values(["Количество конкурентов", "Товарооборот"], ascending=[False, False]).head(15)[sku_cols])
-    opportunity_sku = (sku.loc[sku["Сегмент"] == "Дешевле рынка / высокий ТО"].sort_values(["Количество конкурентов", "Товарооборот"], ascending=[False, False]).head(15)[sku_cols])
-
-    risk_sku_count = int((sku["Сегмент"] == "Дороже рынка / низкий ТО").sum())
-    opp_sku_count = int((sku["Сегмент"] == "Дешевле рынка / высокий ТО").sum())
-
-    excluded_parts = [x for x in [invalid, duplicates, conflict_rows, anomalies] if not x.empty]
+    # 6. Экспорт
+    excluded_parts = [x for x in [invalid, duplicates, anomalies] if not x.empty]
     excluded = pd.concat(excluded_parts, ignore_index=True, sort=False) if excluded_parts else pd.DataFrame()
     
     if not excluded.empty:
-        base_cols = ["city", "sku", "category", "subcategory", "group", "date", "competitor", "competitor_regular", "lenta_regular", "turnover", "competitor_promo", "lenta_promo", "Причина исключения"]
+        base_cols = ["city", "sku", "category", "subcategory", "date", "competitor", "competitor_regular", "lenta_regular", "turnover", "Причина исключения"]
         excluded_export = excluded[[c for c in base_cols if c in excluded.columns]].rename(columns=DISPLAY)
     else:
-        excluded_export = pd.DataFrame(columns=["Город", "СКЮ", "Категория", "Причина исключения"])
+        excluded_export = pd.DataFrame(columns=["Город", "СКЮ", "Причина исключения"])
 
-    clean_export = sku.rename(columns={"city": "Город", "sku": "СКЮ", "category": "Категория", "subcategory": "Подкатегория", "group": "Группа"})
-    final_cols = ["Сегмент", "Достоверность индекса", "Сравнение скидок", "Город", "СКЮ", "Категория", "Подкатегория", "Товарооборот", "Индекс регулярной цены", "Индекс регулярной цены (история)", "Скидка Ленты, %", "Скидка конкурента, %", "Разница скидок, п.п.", "Количество конкурентов", "Последняя дата наблюдения"]
+    clean_export = sku.rename(columns={"city": "Город", "sku": "СКЮ", "category": "Категория", "subcategory": "Подкатегория"})
+    final_cols = ["Сегмент", "Достоверность", "Сравнение скидок", "Город", "СКЮ", "Категория", "Подкатегория", "Товарооборот", "Индекс регулярной цены", "Скидка Ленты, %", "Скидка конкурента, %", "Разница скидок, п.п.", "Количество конкурентов", "Последняя дата"]
     clean_export = clean_export[[c for c in final_cols if c in clean_export.columns]]
 
-    risk_cat_export = risk_categories.rename(columns={"city": "Город", "category": "Категория"})
-    opp_cat_export = opportunity_categories.rename(columns={"city": "Город", "category": "Категория"})
-    risk_sku_export = risk_sku.rename(columns={"city": "Город", "sku": "СКЮ", "category": "Категория", "subcategory": "Подкатегория"})
-    opp_sku_export = opportunity_sku.rename(columns={"city": "Город", "sku": "СКЮ", "category": "Категория", "subcategory": "Подкатегория"})
+    stats = pd.DataFrame([("Всего строк:", int(source_count)), ("Прошли:", int(len(analysis_rows))), (f"Исключено: {len(invalid)+len(duplicates)+len(anomalies)}", "")], columns=["Показатель", "Значение"])
 
-    stats = pd.DataFrame([("Всего строк:", int(source_count)), ("Прошли:", int(len(analysis_rows))), (f"Исключено: {len(invalid)+len(duplicates)+len(conflict_rows)+len(anomalies)}", "")], columns=["Показатель", "Значение"])
-
+    # 7. Запись в Excel (МАКСИМАЛЬНО БЫСТРАЯ, БЕЗ ФОРМАТИРОВАНИЯ)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        wb = writer.book
-        h_fmt = wb.add_format({"bold": True, "font_color": "#FFFFFF", "bg_color": "#39785D"})
-        
-        # УПРОЩЕННАЯ ЗАПИСЬ БЕЗ ТЯЖЕЛОГО ФОРМАТИРОВАНИЯ ДЛЯ СКОРОСТИ
         stats.to_excel(writer, sheet_name="1. Сводка", index=False)
-        
-        pws = wb.add_worksheet("2. Приоритеты")
-        risk_cat_export.to_excel(writer, sheet_name="2. Приоритеты", index=False, startrow=0)
-        risk_sku_export.to_excel(writer, sheet_name="2. Приоритеты", index=False, startrow=len(risk_cat_export)+3)
-        opp_cat_export.to_excel(writer, sheet_name="2. Приоритеты", index=False, startrow=len(risk_cat_export)+len(risk_sku_export)+6)
-        opp_sku_export.to_excel(writer, sheet_name="2. Приоритеты", index=False, startrow=len(risk_cat_export)+len(risk_sku_export)+len(opp_cat_export)+9)
-
-        clean_export.to_excel(writer, sheet_name="3. Очищенные данные", index=False)
-        excluded_export.to_excel(writer, sheet_name="4. Исключенные", index=False)
+        clean_export.to_excel(writer, sheet_name="2. Очищенные данные", index=False)
+        excluded_export.to_excel(writer, sheet_name="3. Исключенные", index=False)
 
     output.seek(0)
     return output
 
-# --- ИНТЕРФЕЙС STREAMLIT ---
+# --- ИНТЕРФЕЙС ---
 st.set_page_config(page_title="Анализ цен Ленты", page_icon="🛒", layout="centered")
 st.title("🛒 Анализ цен и товарооборота «Ленты»")
-st.markdown("Загрузите исходный Excel-файл, и программа сформирует готовый аналитический отчет.")
+st.markdown("Загрузите исходный Excel-файл, и программа сформирует отчет.")
 
 uploaded_file = st.file_uploader("Выберите Excel-файл (.xlsx)", type=["xlsx"])
 
 if uploaded_file is not None:
-    st.info("✅ Файл успешно загружен! Нажмите кнопку ниже.")
+    st.info("✅ Файл загружен! Нажмите кнопку ниже.")
     
     if st.button("🚀 Запустить анализ", use_container_width=True):
-        with st.spinner("⏳ Идет обработка данных..."):
+        with st.spinner("⏳ Идет обработка..."):
             try:
                 excel_data = run_analysis(uploaded_file)
                 st.success("🎉 Анализ успешно завершен!")
                 st.balloons()
                 
                 st.download_button(
-                    label="📥 Скачать готовый отчет",
+                    label="📥 Скачать отчет",
                     data=excel_data,
-                    file_name="Итоговый_отчет_Лента.xlsx",
+                    file_name="Итоговый_отчет.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
