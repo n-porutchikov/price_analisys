@@ -56,7 +56,7 @@ def resolve_columns(columns):
         if found is not None:
             result[canonical] = found
         elif canonical in REQUIRED:
-            missing.append(f"{DISPLAY.get(canonical, canonical)}: {', '.join(aliases)}")
+            missing.append(f"{DISPLAY.get(canonical, canonical)}")
     if missing:
         raise ValueError("Не найдены столбцы: " + ", ".join(missing))
     return result
@@ -110,11 +110,11 @@ def reliability_label(n):
     return "Нет данных"
 
 def run_analysis(input_file):
-    # Читаем файл (используем стандартный openpyxl)
+    # Читаем файл
     try:
-        raw = pd.read_excel(input_file, sheet_name=1, engine="openpyxl")
+        raw = pd.read_excel(input_file, sheet_name=1)
     except Exception:
-        raw = pd.read_excel(input_file, sheet_name=0, engine="openpyxl")
+        raw = pd.read_excel(input_file, sheet_name=0)
 
     if not isinstance(raw, pd.DataFrame) or raw.empty:
         raise ValueError("Файл пуст.")
@@ -142,9 +142,9 @@ def run_analysis(input_file):
     
     def _reason(i):
         parts = []
-        if missing_key.loc[i]: parts.append("Нет SKU/конкурента/даты")
-        if bad_price.loc[i]: parts.append("Некорректная цена")
-        if bad_turnover.loc[i]: parts.append("Некорректный ТО")
+        if missing_key.loc[i]: parts.append("Нет ключа")
+        if bad_price.loc[i]: parts.append("Плохая цена")
+        if bad_turnover.loc[i]: parts.append("Плохой ТО")
         return "; ".join(parts)
 
     invalid["Причина исключения"] = [_reason(i) for i in invalid.index]
@@ -152,10 +152,10 @@ def run_analysis(input_file):
 
     dup_mask = valid.duplicated(keep="first")
     duplicates = valid.loc[dup_mask].copy()
-    duplicates["Причина исключения"] = "Полный дубликат"
+    duplicates["Причина исключения"] = "Дубликат"
     valid = valid.loc[~dup_mask].copy()
 
-    # Считаем индексы и сегменты
+    # Аномалии
     series_key = ["city", "sku", "competitor"]
     valid = valid.sort_values(series_key + ["date"], kind="mergesort").reset_index(drop=True)
     
@@ -177,7 +177,7 @@ def run_analysis(input_file):
     valid["Ценовая аномалия"] = ""
     valid.loc[jump_flag & dev_flag, "Ценовая аномалия"] = "Скачок и отклонение"
     valid.loc[jump_flag & ~dev_flag, "Ценовая аномалия"] = "Резкий скачок"
-    valid.loc[~jump_flag & dev_flag, "Ценовая аномалия"] = "Отклонение от медианы"
+    valid.loc[~jump_flag & dev_flag, "Ценовая аномалия"] = "Отклонение"
 
     anomalies = valid.loc[valid["Ценовая аномалия"].ne("")].copy()
     anomalies["Причина исключения"] = "Аномалия: " + anomalies["Ценовая аномалия"]
@@ -234,20 +234,20 @@ def run_analysis(input_file):
     final_cols = ["Сегмент", "Достоверность", "Сравнение скидок", "Город", "СКЮ", "Категория", "Подкатегория", "Товарооборот", "Индекс регулярной цены", "Скидка Ленты, %", "Скидка конкурента, %", "Разница скидок, п.п.", "Количество конкурентов", "Последняя дата"]
     clean_export = clean_export[[c for c in final_cols if c in clean_export.columns]]
 
-    # ВАЖНО: Заменяем все NaN и inf на пустые строки перед сохранением, чтобы xlsxwriter не упал!
+    # Чистим NaN
     clean_export = clean_export.replace([np.inf, -np.inf], np.nan).fillna("")
     excluded_export = excluded_export.replace([np.inf, -np.inf], np.nan).fillna("")
 
     stats = pd.DataFrame([("Всего строк:", int(source_count)), ("Прошли:", int(len(analysis_rows))), (f"Исключено: {len(invalid)+len(duplicates)+len(anomalies)}", "")], columns=["Показатель", "Значение"])
 
+    # ЗАПИСЬ В EXCEL (используем дефолтный openpyxl вместо xlsxwriter)
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         stats.to_excel(writer, sheet_name="1. Сводка", index=False)
         clean_export.to_excel(writer, sheet_name="2. Очищенные данные", index=False)
         excluded_export.to_excel(writer, sheet_name="3. Исключенные", index=False)
 
-    output.seek(0)
-    return output
+    return output.getvalue()
 
 # --- ИНТЕРФЕЙС ---
 st.set_page_config(page_title="Анализ цен Ленты", page_icon="🛒", layout="centered")
@@ -257,23 +257,24 @@ st.markdown("Загрузите исходный Excel-файл, и програ
 uploaded_file = st.file_uploader("Выберите Excel-файл (.xlsx)", type=["xlsx"])
 
 if uploaded_file is not None:
-    st.info("✅ Файл загружен! Нажмите кнопку ниже.")
+    st.info("✅ Файл загружен!")
     
     if st.button("🚀 Запустить анализ", use_container_width=True):
         with st.spinner("⏳ Идет обработка..."):
             try:
-                excel_data = run_analysis(uploaded_file)
-                st.success("🎉 Анализ успешно завершен!")
-                st.balloons()
+                # Получаем байты файла
+                excel_bytes = run_analysis(uploaded_file)
                 
+                st.success("🎉 Анализ успешно завершен!")
+                
+                # Отдаем на скачивание
                 st.download_button(
                     label="📥 Скачать отчет",
-                    data=excel_data,
-                    file_name="Итоговый_отчет_Лента.xlsx",
+                    data=excel_bytes,
+                    file_name="Итоговый_отчет.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
             except Exception as e:
-                # Если что-то пойдет не так, мы увидим ошибку ПРЯМО НА САЙТЕ, а не в txt файле
-                st.error("Произошла ошибка при создании файла:")
-                st.exception(e)
+                # Если что-то упадет, выведем ошибку ПРЯМО НА САЙТЕ
+                st.error(f"❌ Ошибка: {e}")
